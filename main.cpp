@@ -1,100 +1,80 @@
 #include <Arduino.h>
+#include "Communication_Interface.h"  // Bao gồm thư viện giao tiếp với Driver
 
-// Cấu hình chân GPIO
-#define RS485_DE_RE_GPIO  4
+// --- Cấu hình hằng số ---
+#define ON_SERVO 1
+#define RETURN_OK 0
+#define MAX_RETRIES 3
+
+#define ID_1 1
+#define ID_2 2
+
+// --- Danh sách ID Servo ---
+const int servoIDs[] = {ID_1, ID_2}; 
+const int numServos = sizeof(servoIDs) / sizeof(servoIDs[0]);
+
+// --- Chân GPIO cho RS485 ---
+#define RS485_DE_RE_GPIO  4   // DE & RE nối chung 1 chân
 #define UART_TXD_PIN      17
 #define UART_RXD_PIN      18
 
-// Cấu hình giao tiếp
-#define BAUDRATE          115200
-#define SLAVE_ID          0x01
-#define FRAME_TYPE_ENABLE 0x2A
-#define HEADER            0xAA
-#define TAIL              0xEE
-#define STUFFING_BYTE     0xAA
+// --- Khởi tạo UART RS485 ---
+HardwareSerial RS485Serial(1); // Dùng Serial1 (UART1)
 
-HardwareSerial RS485Serial(1);
-
-// Hàm tính CRC-16 (Modbus)
-uint16_t calculateCRC(uint8_t *data, uint8_t length) {
-    uint16_t crc = 0xFFFF;
-    for (uint8_t pos = 0; pos < length; pos++) {
-        crc ^= (uint16_t)data[pos];
-        for (uint8_t i = 8; i != 0; i--) {
-            if ((crc & 0x0001) != 0) {
-                crc >>= 1;
-                crc ^= 0xA001;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    return crc;
+// --- Hàm bật chế độ gửi ---
+void RS485_WriteEnable() {
+  digitalWrite(RS485_DE_RE_GPIO, HIGH); // DE = HIGH: cho phép gửi
+  delayMicroseconds(100); // Đợi ổn định
 }
 
-void sendServoCommand(bool enable) {
-    // Tạo frame data gốc
-    uint8_t rawData[7]; // SlaveID(2) + FrameType(1) + DataLen(1) + Data(1) + CRC(2)
-    
-    // Slave ID (2 byte little-endian)
-    rawData[0] = SLAVE_ID & 0xFF;       // Low byte = 0x01
-    rawData[1] = (SLAVE_ID >> 8) & 0xFF;// High byte = 0x00
-    
-    // Frame type
-    rawData[2] = FRAME_TYPE_ENABLE;
-    
-    // Data
-    rawData[3] = 0x01; // Data length
-    rawData[4] = enable ? 0x01 : 0x00;
-    
-    // Tính CRC cho 5 byte đầu
-    uint16_t crc = calculateCRC(rawData, 5);
-    rawData[5] = crc & 0xFF;  // CRC low
-    rawData[6] = (crc >> 8) & 0xFF; // CRC high
+// --- Hàm bật chế độ nhận ---
+void RS485_ReadEnable() {
+  delayMicroseconds(100); // Đợi tín hiệu gửi ổn định xong
+  digitalWrite(RS485_DE_RE_GPIO, LOW);  // DE = LOW: cho phép nhận
+}
 
-    // Xử lý byte stuffing
-    uint8_t stuffedData[14]; // Tối đa 7*2 = 14 byte
-    uint8_t stuffedIndex = 0;
-    
-    for(uint8_t i=0; i<7; i++){
-        stuffedData[stuffedIndex++] = rawData[i];
-        if(rawData[i] == HEADER){
-            stuffedData[stuffedIndex++] = STUFFING_BYTE;
-        }
+// --- Gửi gói tin qua RS485 ---
+void RS485_Send(const uint8_t *data, size_t len) {
+  RS485_WriteEnable();
+  RS485Serial.write(data, len);
+  RS485Serial.flush();       // Đợi gửi hết
+  RS485_ReadEnable();        // Trở về chế độ nhận
+}
+
+// --- Hàm bật tất cả servo ---
+void ENABLE_ALL_SERVO() {
+  for (int i = 0; i < numServos; i++) {
+    int retryCount = 0;
+    delay(50);
+
+    while (SERVO_ServoEnable(servoIDs[i], ON_SERVO) != RETURN_OK) {
+      Serial.printf("ENABLE SERVO ID %d - JOINT %d ENABLE AGAIN\n", servoIDs[i], i + 1);
+      delay(200);
+
+      if (++retryCount >= MAX_RETRIES) {
+        Serial.printf("ENABLE SERVO ID %d FAILED!\n", servoIDs[i]);
+        break;
+      }
     }
-
-    // Tạo frame hoàn chỉnh
-    uint8_t finalFrame[stuffedIndex + 4];
-    finalFrame[0] = HEADER;
-    finalFrame[1] = 0xCC;
-    memcpy(&finalFrame[2], stuffedData, stuffedIndex);
-    finalFrame[stuffedIndex + 2] = HEADER;
-    finalFrame[stuffedIndex + 3] = TAIL;
-
-    // Gửi frame
-    digitalWrite(RS485_DE_RE_GPIO, HIGH);
-    RS485Serial.write(finalFrame, stuffedIndex + 4);
-    RS485Serial.flush();
-    digitalWrite(RS485_DE_RE_GPIO, LOW);
+  }
 }
 
 void setup() {
-    Serial.begin(115200);
-    pinMode(RS485_DE_RE_GPIO, OUTPUT);
-    RS485Serial.begin(BAUDRATE, SERIAL_8N1, UART_RXD_PIN, UART_TXD_PIN);
+  // --- Serial monitor ---
+  Serial.begin(115200);
+  while (!Serial);
 
-    Serial.println("\nKhởi động hệ thống...");
-    
-    // Chu trình điều khiển
-    Serial.println("[1/2] BẬT servo");
-    sendServoCommand(true);
-    delay(5000);
-    
-    Serial.println("[2/2] TẮT servo");
-    sendServoCommand(false);
-    delay(5000);
-    
-    Serial.println("HOÀN TẤT CHU TRÌNH");
+  // --- RS485 GPIO setup ---
+  pinMode(RS485_DE_RE_GPIO, OUTPUT);
+  digitalWrite(RS485_DE_RE_GPIO, LOW); // Bắt đầu ở chế độ nhận
+
+  // --- UART1 (RS485) setup ---
+  RS485Serial.begin(115200, SERIAL_8N1, UART_RXD_PIN, UART_TXD_PIN);
+
+  Serial.println("Starting RS485 Servo Enable Sequence...");
+  ENABLE_ALL_SERVO();
 }
 
-void loop() {}
+void loop() {
+  // Có thể nhận phản hồi hoặc gửi thêm lệnh nếu cần
+}
